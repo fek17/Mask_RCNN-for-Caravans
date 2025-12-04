@@ -143,88 +143,133 @@ def fetch_osm_caravans(minx, miny, maxx, maxy, width, height, center_lat, center
     Returns:
         tuple: (mask array, list of caravan dicts with osm_id, geometry, building_type)
     """
-    print("  Fetching OSM caravan data...")
-
     # Calculate distance for query (diagonal / 2 with buffer)
     dist = math.sqrt((maxx - minx)**2 + (maxy - miny)**2) / 2 * 1.5
 
+    all_caravans = []
+
+    # Query 1: Individual caravan buildings
     try:
-        # Query for caravan-related buildings
         caravans = ox.features_from_point(
             (center_lat, center_lon),
             tags={
-                'building': ['static_caravan', 'caravan', 'mobile_home']
+                'building': ['static_caravan', 'caravan', 'mobile_home', 'chalet', 'hut']
             },
             dist=dist
         )
-
-        if len(caravans) == 0:
-            print("    No caravans found in area")
-            return np.zeros((height, width), dtype=np.uint8), []
-
-        # Convert to Web Mercator
-        caravans = caravans.to_crs(3857)
-
-        # Filter to polygons only
-        caravans = caravans[caravans.geometry.type.isin(['Polygon', 'MultiPolygon'])]
-
-        print(f"    Found {len(caravans)} caravan polygons")
-
-        if len(caravans) == 0:
-            return np.zeros((height, width), dtype=np.uint8), []
-
-        # Create transform for rasterization
-        pixel_width = (maxx - minx) / width
-        pixel_height = (maxy - miny) / height
-        transform = Affine(pixel_width, 0, minx, 0, -pixel_height, maxy)
-
-        # Rasterize for mask
-        shapes = [(geom, 1) for geom in caravans.geometry]
-        caravan_mask = rasterize(
-            shapes=shapes,
-            out_shape=(height, width),
-            transform=transform,
-            fill=0,
-            dtype=np.uint8
-        )
-
-        # Extract caravan info for deduplication
-        caravan_list = []
-        for idx, row in caravans.iterrows():
-            # Get OSM ID from index (osmnx uses osmid as index)
-            if isinstance(idx, tuple):
-                osm_type, osm_id = idx[0], idx[1]
-            else:
-                osm_type, osm_id = 'way', idx
-
-            building_type = row.get('building', 'unknown')
-            geom = row.geometry
-
-            # Get centroid
-            centroid = geom.centroid
-            centroid_lon, centroid_lat = merc_to_lonlat(centroid.x, centroid.y)
-
-            # Convert geometry to lon/lat for storage
-            if geom.type == 'Polygon':
-                coords = [(merc_to_lonlat(x, y)) for x, y in geom.exterior.coords]
-            else:
-                coords = []
-
-            caravan_list.append({
-                'osm_id': osm_id,
-                'osm_type': osm_type,
-                'building_type': building_type,
-                'centroid_lat': centroid_lat,
-                'centroid_lon': centroid_lon,
-                'geometry_merc': geom,
-                'coords_lonlat': coords
-            })
-
-        return caravan_mask, caravan_list
-
+        if len(caravans) > 0:
+            caravans = caravans.to_crs(3857)
+            caravans = caravans[caravans.geometry.type.isin(['Polygon', 'MultiPolygon'])]
+            caravans['feature_type'] = 'building'
+            all_caravans.append(caravans)
+            print(f"    Found {len(caravans)} caravan buildings")
     except Exception as e:
-        print(f"    Warning: Could not fetch caravans: {e}")
+        if "No matching features" not in str(e):
+            print(f"    Warning querying buildings: {e}")
+
+    # Query 2: Caravan site boundaries (tourism=caravan_site)
+    try:
+        sites = ox.features_from_point(
+            (center_lat, center_lon),
+            tags={
+                'tourism': ['caravan_site', 'camp_site']
+            },
+            dist=dist
+        )
+        if len(sites) > 0:
+            sites = sites.to_crs(3857)
+            sites = sites[sites.geometry.type.isin(['Polygon', 'MultiPolygon'])]
+            sites['feature_type'] = 'site_boundary'
+            # Don't add site boundaries to caravan count - just note them
+            if len(sites) > 0:
+                print(f"    Found {len(sites)} caravan SITE boundaries (not individual units)")
+    except Exception as e:
+        if "No matching features" not in str(e):
+            print(f"    Warning querying sites: {e}")
+
+    # Query 3: Leisure pitches (individual camping/caravan pitches)
+    try:
+        pitches = ox.features_from_point(
+            (center_lat, center_lon),
+            tags={
+                'tourism': 'camp_pitch',
+                'leisure': 'pitch'
+            },
+            dist=dist
+        )
+        if len(pitches) > 0:
+            pitches = pitches.to_crs(3857)
+            pitches = pitches[pitches.geometry.type.isin(['Polygon', 'MultiPolygon'])]
+            pitches['feature_type'] = 'pitch'
+            all_caravans.append(pitches)
+            print(f"    Found {len(pitches)} camping/caravan pitches")
+    except Exception as e:
+        if "No matching features" not in str(e):
+            print(f"    Warning querying pitches: {e}")
+
+    # Combine all results
+    if not all_caravans:
+        print("    No individual caravans mapped in OSM for this area")
+        print("    TIP: Use Mask R-CNN model to detect caravans from imagery")
         return np.zeros((height, width), dtype=np.uint8), []
+
+    caravans = gpd.GeoDataFrame(pd.concat(all_caravans, ignore_index=True), crs=3857)
+    print(f"    Total: {len(caravans)} caravan features")
+
+    if len(caravans) == 0:
+        return np.zeros((height, width), dtype=np.uint8), []
+
+    # Create transform for rasterization
+    pixel_width = (maxx - minx) / width
+    pixel_height = (maxy - miny) / height
+    transform = Affine(pixel_width, 0, minx, 0, -pixel_height, maxy)
+
+    # Rasterize for mask
+    shapes = [(geom, 1) for geom in caravans.geometry]
+    caravan_mask = rasterize(
+        shapes=shapes,
+        out_shape=(height, width),
+        transform=transform,
+        fill=0,
+        dtype=np.uint8
+    )
+
+    # Extract caravan info for deduplication
+    caravan_list = []
+    for idx, row in caravans.iterrows():
+        # Get OSM ID from index or column
+        if 'osmid' in caravans.columns:
+            osm_id = row.get('osmid', idx)
+        elif isinstance(idx, tuple):
+            osm_id = idx[1] if len(idx) > 1 else idx[0]
+        else:
+            osm_id = idx
+
+        building_type = row.get('building', row.get('tourism', row.get('leisure', 'unknown')))
+        feature_type = row.get('feature_type', 'unknown')
+        geom = row.geometry
+
+        # Get centroid
+        centroid = geom.centroid
+        centroid_lon, centroid_lat = merc_to_lonlat(centroid.x, centroid.y)
+
+        # Convert geometry to lon/lat for storage
+        if geom.type == 'Polygon':
+            coords = [(merc_to_lonlat(x, y)) for x, y in geom.exterior.coords]
+        else:
+            coords = []
+
+        caravan_list.append({
+            'osm_id': osm_id,
+            'osm_type': feature_type,
+            'building_type': building_type,
+            'centroid_lat': centroid_lat,
+            'centroid_lon': centroid_lon,
+            'geometry_merc': geom,
+            'coords_lonlat': coords
+        })
+
+    return caravan_mask, caravan_list
 
 
 # ============================================================================
