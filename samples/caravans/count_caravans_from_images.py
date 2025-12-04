@@ -1,10 +1,11 @@
 """
-Count Caravans from Satellite Images with OSM Overlay
+Count Caravans from Satellite Images using Mask R-CNN
 
-Processes folders of satellite images, fetches caravan polygons from OpenStreetMap
-using osmnx, overlays them on images, and outputs deduplicated counts to Excel.
+Processes folders of satellite images, detects caravans using the trained Mask R-CNN
+model, overlays them on images, and outputs deduplicated counts to Excel.
 
-Similar approach to the parking lot detection script - uses osmnx for OSM data.
+Can also use OpenStreetMap data as a fallback if model weights are not provided,
+but OSM coverage for individual caravans is limited.
 
 Expected folder structure:
     images/
@@ -15,10 +16,16 @@ Expected folder structure:
         └── ...
 
 Usage:
-    python count_caravans_from_images.py --input_dir ./images --output results.xlsx --save_overlays
+    # Using Mask R-CNN model (recommended)
+    python count_caravans_from_images.py --input_dir ./images --output results.xlsx \\
+        --weights /path/to/mask_rcnn_caravan.h5 --save_overlays
+
+    # Using OSM data (fallback - limited coverage)
+    python count_caravans_from_images.py --input_dir ./images --output results.xlsx --use_osm
 
 Requirements:
-    pip install pandas openpyxl osmnx geopandas shapely Pillow rasterio affine
+    pip install pandas openpyxl Pillow numpy scikit-image tensorflow keras
+    # For OSM mode: pip install osmnx geopandas shapely rasterio affine
 
 Copyright (c) 2024
 """
@@ -36,14 +43,54 @@ from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 from collections import defaultdict
 from io import BytesIO
+import hashlib
+import uuid
 
-# OSM/Geo libraries
-import osmnx as ox
-import geopandas as gpd
-from shapely.geometry import box, Point, Polygon, MultiPolygon
-from shapely.ops import unary_union
-from rasterio.features import rasterize
-from affine import Affine
+# Add Mask R-CNN to path
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+sys.path.insert(0, ROOT_DIR)
+
+# Mask R-CNN imports (optional - only needed if using model)
+MRCNN_AVAILABLE = False
+try:
+    from mrcnn.config import Config
+    from mrcnn import model as modellib
+    import skimage.io
+    MRCNN_AVAILABLE = True
+except ImportError:
+    pass
+
+# OSM/Geo libraries (optional - only needed if using OSM mode)
+OSM_AVAILABLE = False
+try:
+    import osmnx as ox
+    import geopandas as gpd
+    from shapely.geometry import box, Point, Polygon, MultiPolygon
+    from shapely.ops import unary_union
+    from rasterio.features import rasterize
+    from affine import Affine
+    OSM_AVAILABLE = True
+except ImportError:
+    pass
+
+
+# ============================================================================
+# MASK R-CNN CONFIGURATION
+# ============================================================================
+
+class CaravanConfig(Config):
+    """Configuration for caravan detection inference."""
+    NAME = "caravan"
+    GPU_COUNT = 1
+    IMAGES_PER_GPU = 1
+    NUM_CLASSES = 1 + 1  # Background + caravan
+    DETECTION_MIN_CONFIDENCE = 0.7
+    BACKBONE = "resnet101"
+
+
+# Global model instance (loaded once)
+_model = None
+_model_weights_path = None
 
 
 # ============================================================================
@@ -127,6 +174,139 @@ def parse_filename(filename):
 
 
 # ============================================================================
+# MASK R-CNN MODEL FUNCTIONS
+# ============================================================================
+
+def load_model(weights_path):
+    """Load the Mask R-CNN model with trained weights."""
+    global _model, _model_weights_path
+
+    if _model is not None and _model_weights_path == weights_path:
+        return _model
+
+    if not MRCNN_AVAILABLE:
+        raise ImportError(
+            "Mask R-CNN not available. Install with:\n"
+            "  pip install tensorflow keras\n"
+            "And ensure mrcnn package is in the path."
+        )
+
+    if not os.path.exists(weights_path):
+        raise FileNotFoundError(f"Model weights not found: {weights_path}")
+
+    print(f"Loading Mask R-CNN model from: {weights_path}")
+    config = CaravanConfig()
+    _model = modellib.MaskRCNN(mode="inference", config=config, model_dir=ROOT_DIR)
+    _model.load_weights(weights_path, by_name=True)
+    _model_weights_path = weights_path
+    print("Model loaded successfully!")
+
+    return _model
+
+
+def detect_caravans_mrcnn(image_array, model):
+    """
+    Detect caravans in an image using Mask R-CNN.
+
+    Args:
+        image_array: RGB image as numpy array (H, W, 3)
+        model: Loaded Mask R-CNN model
+
+    Returns:
+        tuple: (mask, list of caravan dicts)
+    """
+    # Run detection
+    results = model.detect([image_array], verbose=0)[0]
+
+    masks = results['masks']      # (H, W, N) boolean array
+    scores = results['scores']    # (N,) confidence scores
+    rois = results['rois']        # (N, 4) bounding boxes [y1, x1, y2, x2]
+
+    height, width = image_array.shape[:2]
+    num_detections = masks.shape[2] if len(masks.shape) == 3 else 0
+
+    # Create combined mask
+    if num_detections > 0:
+        combined_mask = np.any(masks, axis=2).astype(np.uint8)
+    else:
+        combined_mask = np.zeros((height, width), dtype=np.uint8)
+
+    # Extract individual caravan info
+    caravan_list = []
+    for i in range(num_detections):
+        mask_i = masks[:, :, i]
+        y1, x1, y2, x2 = rois[i]
+        score = scores[i]
+
+        # Calculate centroid from mask
+        ys, xs = np.where(mask_i)
+        if len(xs) > 0 and len(ys) > 0:
+            centroid_x = np.mean(xs)
+            centroid_y = np.mean(ys)
+        else:
+            centroid_x = (x1 + x2) / 2
+            centroid_y = (y1 + y2) / 2
+
+        # Generate unique ID based on position and mask
+        # This helps with deduplication across overlapping images
+        pos_hash = hashlib.md5(f"{centroid_x:.1f}_{centroid_y:.1f}_{mask_i.sum()}".encode()).hexdigest()[:12]
+        detection_id = f"det_{pos_hash}"
+
+        caravan_list.append({
+            'osm_id': detection_id,  # Using same key for compatibility
+            'osm_type': 'detection',
+            'building_type': 'caravan',
+            'confidence': float(score),
+            'bbox': [int(x1), int(y1), int(x2), int(y2)],
+            'centroid_x': float(centroid_x),
+            'centroid_y': float(centroid_y),
+            'pixel_count': int(mask_i.sum()),
+            'mask': mask_i  # Keep mask for overlay
+        })
+
+    return combined_mask, caravan_list
+
+
+def deduplicate_detections_spatial(all_caravans, overlap_threshold=0.5):
+    """
+    Deduplicate caravan detections across images using spatial proximity.
+
+    For detections (unlike OSM), we can't rely on IDs, so we use centroid proximity
+    and size similarity.
+    """
+    if not all_caravans:
+        return {}
+
+    # Sort by pixel count (larger first - keep the best detection)
+    sorted_caravans = sorted(all_caravans.values(), key=lambda x: x.get('pixel_count', 0), reverse=True)
+
+    unique = {}
+    for caravan in sorted_caravans:
+        is_duplicate = False
+
+        for existing_id, existing in unique.items():
+            # Check if centroids are close (within ~20 pixels at the overlapping region)
+            dx = abs(caravan.get('centroid_x', 0) - existing.get('centroid_x', 0))
+            dy = abs(caravan.get('centroid_y', 0) - existing.get('centroid_y', 0))
+            dist = math.sqrt(dx**2 + dy**2)
+
+            # Also check if sizes are similar
+            size1 = caravan.get('pixel_count', 0)
+            size2 = existing.get('pixel_count', 0)
+            size_ratio = min(size1, size2) / max(size1, size2) if max(size1, size2) > 0 else 0
+
+            # Consider duplicate if close and similar size
+            if dist < 30 and size_ratio > 0.5:
+                is_duplicate = True
+                break
+
+        if not is_duplicate:
+            unique[caravan['osm_id']] = caravan
+
+    return unique
+
+
+# ============================================================================
 # OSM DATA FETCHING (using osmnx like your parking script)
 # ============================================================================
 
@@ -166,6 +346,29 @@ def fetch_osm_caravans(minx, miny, maxx, maxy, width, height, center_lat, center
     except Exception as e:
         if "No matching features" not in str(e):
             print(f"    Warning querying buildings: {e}")
+
+    # Query 1b: Features tagged with caravans=yes (camp pitches that allow caravans)
+    try:
+        caravan_pitches = ox.features_from_point(
+            (center_lat, center_lon),
+            tags={
+                'caravans': True  # Matches caravans=yes, caravans=no, etc.
+            },
+            dist=dist
+        )
+        if len(caravan_pitches) > 0:
+            # Filter to only caravans=yes
+            if 'caravans' in caravan_pitches.columns:
+                caravan_pitches = caravan_pitches[caravan_pitches['caravans'] == 'yes']
+            caravan_pitches = caravan_pitches.to_crs(3857)
+            caravan_pitches = caravan_pitches[caravan_pitches.geometry.type.isin(['Polygon', 'MultiPolygon'])]
+            caravan_pitches['feature_type'] = 'caravan_pitch'
+            if len(caravan_pitches) > 0:
+                all_caravans.append(caravan_pitches)
+                print(f"    Found {len(caravan_pitches)} pitches with caravans=yes")
+    except Exception as e:
+        if "No matching features" not in str(e):
+            print(f"    Warning querying caravans=yes: {e}")
 
     # Query 2: Caravan site boundaries (tourism=caravan_site)
     try:
@@ -335,15 +538,22 @@ def draw_caravan_count(image, count, position=(10, 10)):
 # MAIN PROCESSING
 # ============================================================================
 
-def process_single_image(image_path, output_dir=None, save_overlay=False):
+def process_single_image(image_path, output_dir=None, save_overlay=False,
+                         model=None, use_osm=False):
     """
     Process a single satellite image.
 
+    Args:
+        image_path: Path to the satellite image
+        output_dir: Directory to save overlays
+        save_overlay: Whether to save annotated images
+        model: Loaded Mask R-CNN model (if using model detection)
+        use_osm: Whether to use OSM data instead of model
+
     Returns:
-        dict with image info and list of caravans found
+        tuple: (file_info dict, list of caravans found)
     """
     filename = os.path.basename(image_path)
-    print(f"\nProcessing: {filename}")
 
     # Parse filename
     file_info = parse_filename(filename)
@@ -356,20 +566,31 @@ def process_single_image(image_path, output_dir=None, save_overlay=False):
     img_array = np.array(image)
     height, width = img_array.shape[:2]
 
-    # Get image bounds
-    minx, miny, maxx, maxy, transform = get_image_bounds_from_corners(
-        file_info['tl_lat'], file_info['tl_lon'],
-        file_info['br_lat'], file_info['br_lon'],
-        width, height
-    )
+    if use_osm:
+        # OSM mode - fetch from OpenStreetMap
+        if not OSM_AVAILABLE:
+            print("  Error: OSM libraries not available")
+            return file_info, []
 
-    # Fetch caravans
-    caravan_mask, caravan_list = fetch_osm_caravans(
-        minx, miny, maxx, maxy, width, height,
-        file_info['center_lat'], file_info['center_lon']
-    )
+        # Get image bounds
+        minx, miny, maxx, maxy, transform = get_image_bounds_from_corners(
+            file_info['tl_lat'], file_info['tl_lon'],
+            file_info['br_lat'], file_info['br_lon'],
+            width, height
+        )
 
-    print(f"  Found {len(caravan_list)} caravans in this image")
+        # Fetch caravans from OSM
+        caravan_mask, caravan_list = fetch_osm_caravans(
+            minx, miny, maxx, maxy, width, height,
+            file_info['center_lat'], file_info['center_lon']
+        )
+    else:
+        # Model mode - use Mask R-CNN
+        if model is None:
+            print("  Error: No model loaded for detection")
+            return file_info, []
+
+        caravan_mask, caravan_list = detect_caravans_mrcnn(img_array, model)
 
     # Save annotated image if requested
     if save_overlay and output_dir and len(caravan_list) > 0:
@@ -379,7 +600,6 @@ def process_single_image(image_path, output_dir=None, save_overlay=False):
         overlay_filename = f"overlay_{filename}"
         overlay_path = os.path.join(output_dir, overlay_filename)
         Image.fromarray(annotated).save(overlay_path, quality=95)
-        print(f"  Saved overlay: {overlay_filename}")
 
     return file_info, caravan_list
 
@@ -409,11 +629,20 @@ def scan_image_folders(root_dir):
     return dict(parks)
 
 
-def process_park(park_name, images, output_dir=None, save_overlays=False):
+def process_park(park_name, images, output_dir=None, save_overlays=False,
+                 model=None, use_osm=False):
     """
-    Process all images for a single park, deduplicating caravans by OSM ID.
+    Process all images for a single park, deduplicating caravans.
+
+    Args:
+        park_name: Name of the caravan park
+        images: List of image info dicts
+        output_dir: Directory for output files
+        save_overlays: Whether to save annotated images
+        model: Loaded Mask R-CNN model (if using model detection)
+        use_osm: Whether to use OSM data instead of model
     """
-    all_caravans = {}  # osm_id -> caravan info (for deduplication)
+    all_caravans = {}  # id -> caravan info (for deduplication)
 
     print(f"\n  Processing {len(images)} images...")
 
@@ -433,22 +662,34 @@ def process_park(park_name, images, output_dir=None, save_overlays=False):
             file_info, caravan_list = process_single_image(
                 filepath,
                 output_dir=park_overlay_dir,
-                save_overlay=save_overlays
+                save_overlay=save_overlays,
+                model=model,
+                use_osm=use_osm
             )
 
-            # Deduplicate by OSM ID
+            # For OSM mode, deduplicate by OSM ID
+            # For model mode, we'll do spatial deduplication after
             new_count = 0
             for caravan in caravan_list:
-                osm_id = caravan['osm_id']
-                if osm_id not in all_caravans:
-                    all_caravans[osm_id] = caravan
+                caravan_id = caravan['osm_id']
+                if caravan_id not in all_caravans:
+                    all_caravans[caravan_id] = caravan
                     new_count += 1
 
             print(f"found {len(caravan_list)} ({new_count} new)")
 
         except Exception as e:
             print(f"ERROR: {e}")
+            import traceback
+            traceback.print_exc()
             continue
+
+    # For model detections, do additional spatial deduplication
+    # (since hash-based IDs might differ for same caravan in different images)
+    if not use_osm and len(all_caravans) > 0:
+        print(f"  Performing spatial deduplication...")
+        all_caravans = deduplicate_detections_spatial(all_caravans)
+        print(f"  After deduplication: {len(all_caravans)} unique caravans")
 
     # Count by type
     type_counts = defaultdict(int)
@@ -466,8 +707,18 @@ def process_park(park_name, images, output_dir=None, save_overlays=False):
     }
 
 
-def process_all_parks(input_dir, output_excel, save_overlays=False):
-    """Process all caravan parks found in the input directory."""
+def process_all_parks(input_dir, output_excel, save_overlays=False,
+                      weights_path=None, use_osm=False):
+    """
+    Process all caravan parks found in the input directory.
+
+    Args:
+        input_dir: Root directory containing park folders with satellite images
+        output_excel: Path to output Excel file
+        save_overlays: Whether to save annotated images
+        weights_path: Path to Mask R-CNN model weights (if using model detection)
+        use_osm: Whether to use OSM data instead of model
+    """
     print(f"\nScanning {input_dir} for satellite images...")
     parks = scan_image_folders(input_dir)
 
@@ -480,6 +731,17 @@ def process_all_parks(input_dir, output_excel, save_overlays=False):
     for park_name, images in parks.items():
         print(f"  - {park_name}: {len(images)} images")
 
+    # Load model if using model detection
+    model = None
+    if not use_osm:
+        if weights_path is None:
+            print("\nERROR: Model weights required for detection.")
+            print("Please provide --weights /path/to/mask_rcnn_caravan.h5")
+            print("Or use --use_osm for OSM data (limited coverage)")
+            return pd.DataFrame()
+
+        model = load_model(weights_path)
+
     output_dir = os.path.dirname(output_excel) if output_excel else '.'
 
     # Process each park
@@ -491,7 +753,9 @@ def process_all_parks(input_dir, output_excel, save_overlays=False):
 
         park_result = process_park(
             park_name, images, output_dir,
-            save_overlays=save_overlays
+            save_overlays=save_overlays,
+            model=model,
+            use_osm=use_osm
         )
 
         results.append({
@@ -516,13 +780,16 @@ def process_all_parks(input_dir, output_excel, save_overlays=False):
     print(f"\n{'='*60}")
     print("SUMMARY")
     print(f"{'='*60}")
+    mode_str = "OSM data" if use_osm else "Mask R-CNN model"
+    print(f"Detection mode: {mode_str}")
     print(f"Total parks processed: {len(df)}")
     print(f"Total caravans found: {df['caravan_count'].sum()}")
     print(f"  - Static caravans: {df['static_caravans'].sum()}")
     print(f"  - Mobile homes: {df['mobile_homes'].sum()}")
     print(f"  - Other caravans: {df['other_caravans'].sum()}")
-    print(f"Average caravans per park: {df['caravan_count'].mean():.1f}")
-    print(f"Max caravans at single park: {df['caravan_count'].max()}")
+    if len(df) > 0:
+        print(f"Average caravans per park: {df['caravan_count'].mean():.1f}")
+        print(f"Max caravans at single park: {df['caravan_count'].max()}")
     print(f"{'='*60}")
 
     return df
@@ -530,17 +797,31 @@ def process_all_parks(input_dir, output_excel, save_overlays=False):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Count caravan polygons from OSM and overlay on satellite images.',
+        description='Count caravans in satellite images using Mask R-CNN or OSM data.',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    python count_caravans_from_images.py --input_dir ./images --output results.xlsx
+    # Using Mask R-CNN model (recommended - requires trained weights)
+    python count_caravans_from_images.py --input_dir ./images --output results.xlsx \\
+        --weights ./logs/caravan20xx/mask_rcnn_caravan_xxxx.h5 --save_overlays
 
-    # With overlay images
-    python count_caravans_from_images.py --input_dir ./images --output results.xlsx --save_overlays
+    # Using OSM data (fallback - limited coverage for individual caravans)
+    python count_caravans_from_images.py --input_dir ./images --output results.xlsx --use_osm
+
+Detection Modes:
+    --weights PATH    Use Mask R-CNN model for detection (recommended)
+                      The model should be trained on caravan imagery.
+                      See caravan.py for training instructions.
+
+    --use_osm         Use OpenStreetMap data instead of model detection.
+                      WARNING: OSM has limited coverage for individual caravans.
+                      Most sites only have the site boundary mapped, not
+                      individual caravan units.
 
 Requirements:
-    pip install pandas openpyxl osmnx geopandas shapely Pillow rasterio affine
+    For model mode: pip install tensorflow keras scikit-image
+    For OSM mode:   pip install osmnx geopandas shapely rasterio affine
+    Both modes:     pip install pandas openpyxl Pillow numpy
         """
     )
 
@@ -548,8 +829,14 @@ Requirements:
                         help='Root directory containing park folders with satellite images')
     parser.add_argument('--output', required=True,
                         help='Path to output Excel file')
+    parser.add_argument('--weights', default=None,
+                        help='Path to Mask R-CNN model weights (.h5 file)')
+    parser.add_argument('--use_osm', action='store_true',
+                        help='Use OSM data instead of model (limited coverage)')
     parser.add_argument('--save_overlays', action='store_true',
-                        help='Save images with polygon overlays')
+                        help='Save images with detection overlays')
+    parser.add_argument('--confidence', type=float, default=0.7,
+                        help='Detection confidence threshold (default: 0.7)')
 
     args = parser.parse_args()
 
@@ -557,11 +844,34 @@ Requirements:
         print(f"Error: Input directory not found: {args.input_dir}")
         sys.exit(1)
 
+    # Validate mode
+    if not args.use_osm and args.weights is None:
+        print("ERROR: You must specify either --weights or --use_osm")
+        print("\nOptions:")
+        print("  1. Use Mask R-CNN model (recommended):")
+        print("     --weights /path/to/mask_rcnn_caravan.h5")
+        print("")
+        print("  2. Use OSM data (limited coverage):")
+        print("     --use_osm")
+        print("")
+        print("To train a model, see: python caravan.py train --help")
+        sys.exit(1)
+
+    if args.weights and not os.path.exists(args.weights):
+        print(f"Error: Model weights not found: {args.weights}")
+        sys.exit(1)
+
+    # Update config confidence if specified
+    if args.confidence != 0.7:
+        CaravanConfig.DETECTION_MIN_CONFIDENCE = args.confidence
+
     try:
         df = process_all_parks(
             input_dir=args.input_dir,
             output_excel=args.output,
-            save_overlays=args.save_overlays
+            save_overlays=args.save_overlays,
+            weights_path=args.weights,
+            use_osm=args.use_osm
         )
     except Exception as e:
         print(f"Error: {e}")
