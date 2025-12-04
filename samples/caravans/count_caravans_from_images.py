@@ -1,11 +1,10 @@
 """
-Count Caravans from Satellite Images using Mask R-CNN
+Count Caravans from Satellite Images
 
-Processes folders of satellite images, detects caravans using the trained Mask R-CNN
-model, overlays them on images, and outputs deduplicated counts to Excel.
-
-Can also use OpenStreetMap data as a fallback if model weights are not provided,
-but OSM coverage for individual caravans is limited.
+Processes folders of satellite images, counts caravans using one of three methods:
+1. OS Data Hub API (recommended) - Uses Ordnance Survey MasterMap data
+2. Mask R-CNN model - Uses trained detection model
+3. OpenStreetMap (limited) - OSM has few individual caravans mapped
 
 Expected folder structure:
     images/
@@ -16,7 +15,11 @@ Expected folder structure:
         └── ...
 
 Usage:
-    # Using Mask R-CNN model (recommended)
+    # Using OS Data Hub API (recommended - most accurate)
+    python count_caravans_from_images.py --input_dir ./images --output results.xlsx \\
+        --os_api_key YOUR_API_KEY --save_overlays
+
+    # Using Mask R-CNN model
     python count_caravans_from_images.py --input_dir ./images --output results.xlsx \\
         --weights /path/to/mask_rcnn_caravan.h5 --save_overlays
 
@@ -24,8 +27,7 @@ Usage:
     python count_caravans_from_images.py --input_dir ./images --output results.xlsx --use_osm
 
 Requirements:
-    pip install pandas openpyxl Pillow numpy scikit-image tensorflow keras
-    # For OSM mode: pip install osmnx geopandas shapely rasterio affine
+    pip install pandas openpyxl Pillow numpy requests geopandas shapely rasterio affine
 
 Copyright (c) 2024
 """
@@ -45,6 +47,7 @@ from collections import defaultdict
 from io import BytesIO
 import hashlib
 import uuid
+import requests
 
 # Add Mask R-CNN to path
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
@@ -60,15 +63,23 @@ try:
 except ImportError:
     pass
 
-# OSM/Geo libraries (optional - only needed if using OSM mode)
-OSM_AVAILABLE = False
+# Geo libraries (needed for OS API and OSM modes)
+GEO_AVAILABLE = False
 try:
-    import osmnx as ox
     import geopandas as gpd
     from shapely.geometry import box, Point, Polygon, MultiPolygon
     from shapely.ops import unary_union
     from rasterio.features import rasterize
     from affine import Affine
+    from pyproj import Transformer
+    GEO_AVAILABLE = True
+except ImportError:
+    pass
+
+# OSM library (optional - only for OSM mode)
+OSM_AVAILABLE = False
+try:
+    import osmnx as ox
     OSM_AVAILABLE = True
 except ImportError:
     pass
