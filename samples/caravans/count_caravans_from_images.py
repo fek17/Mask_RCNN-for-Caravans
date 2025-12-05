@@ -318,6 +318,118 @@ def deduplicate_detections_spatial(all_caravans, overlap_threshold=0.5):
 
 
 # ============================================================================
+# GEOJSON DATA LOADING (pre-downloaded caravan data)
+# ============================================================================
+
+# Global cache for loaded GeoJSON data
+_geojson_cache = None
+_geojson_path = None
+
+
+def load_geojson_caravans(geojson_path):
+    """
+    Load caravan polygons from a pre-downloaded GeoJSON file.
+
+    The GeoJSON should be created by download_uk_caravans.py or similar,
+    containing polygon features with building type tags.
+    """
+    global _geojson_cache, _geojson_path
+
+    if _geojson_cache is not None and _geojson_path == geojson_path:
+        return _geojson_cache
+
+    if not GEO_AVAILABLE:
+        raise ImportError("geopandas required for GeoJSON mode. Install with: pip install geopandas")
+
+    print(f"Loading caravan data from: {geojson_path}")
+    gdf = gpd.read_file(geojson_path)
+
+    # Ensure it's in WGS84 (lat/lon)
+    if gdf.crs is None:
+        gdf = gdf.set_crs(epsg=4326)
+    elif gdf.crs.to_epsg() != 4326:
+        gdf = gdf.to_crs(epsg=4326)
+
+    # Filter to only polygons
+    gdf = gdf[gdf.geometry.type.isin(['Polygon', 'MultiPolygon'])]
+
+    print(f"  Loaded {len(gdf)} caravan polygons")
+
+    _geojson_cache = gdf
+    _geojson_path = geojson_path
+
+    return gdf
+
+
+def fetch_caravans_from_geojson(geojson_gdf, min_lat, min_lon, max_lat, max_lon,
+                                 width, height):
+    """
+    Find caravans from pre-loaded GeoJSON that fall within the image bounds.
+
+    Args:
+        geojson_gdf: GeoDataFrame of caravan polygons
+        min_lat, min_lon, max_lat, max_lon: Image bounds in WGS84
+        width, height: Image dimensions in pixels
+
+    Returns:
+        tuple: (mask array, list of caravan dicts)
+    """
+    if not GEO_AVAILABLE:
+        return np.zeros((height, width), dtype=np.uint8), []
+
+    # Create bounding box for spatial query
+    bbox = box(min_lon, min_lat, max_lon, max_lat)
+
+    # Find caravans that intersect with the image bounds
+    caravans_in_bounds = geojson_gdf[geojson_gdf.geometry.intersects(bbox)].copy()
+
+    if len(caravans_in_bounds) == 0:
+        return np.zeros((height, width), dtype=np.uint8), []
+
+    # Convert to Web Mercator for rasterization
+    caravans_merc = caravans_in_bounds.to_crs(epsg=3857)
+
+    # Get image bounds in Web Mercator
+    minx, miny = lonlat_to_merc(min_lon, min_lat)
+    maxx, maxy = lonlat_to_merc(max_lon, max_lat)
+
+    # Create transform for rasterization
+    pixel_width = (maxx - minx) / width
+    pixel_height = (maxy - miny) / height
+    transform = Affine(pixel_width, 0, minx, 0, -pixel_height, maxy)
+
+    # Rasterize for mask
+    shapes = [(geom, 1) for geom in caravans_merc.geometry]
+    caravan_mask = rasterize(
+        shapes=shapes,
+        out_shape=(height, width),
+        transform=transform,
+        fill=0,
+        dtype=np.uint8
+    )
+
+    # Extract caravan info for counting
+    caravan_list = []
+    for idx, row in caravans_in_bounds.iterrows():
+        osm_id = row.get('osm_id', idx)
+        building_type = row.get('building', 'caravan')
+        geom = row.geometry
+
+        # Get centroid
+        centroid = geom.centroid
+
+        caravan_list.append({
+            'osm_id': osm_id,
+            'osm_type': 'geojson',
+            'building_type': building_type,
+            'centroid_lat': centroid.y,
+            'centroid_lon': centroid.x,
+        })
+
+    return caravan_mask, caravan_list
+
+
+# ============================================================================
 # OSM DATA FETCHING (using osmnx like your parking script)
 # ============================================================================
 
@@ -550,7 +662,7 @@ def draw_caravan_count(image, count, position=(10, 10)):
 # ============================================================================
 
 def process_single_image(image_path, output_dir=None, save_overlay=False,
-                         model=None, use_osm=False):
+                         model=None, use_osm=False, geojson_gdf=None):
     """
     Process a single satellite image.
 
@@ -560,6 +672,7 @@ def process_single_image(image_path, output_dir=None, save_overlay=False,
         save_overlay: Whether to save annotated images
         model: Loaded Mask R-CNN model (if using model detection)
         use_osm: Whether to use OSM data instead of model
+        geojson_gdf: Pre-loaded GeoDataFrame of caravan polygons
 
     Returns:
         tuple: (file_info dict, list of caravans found)
@@ -577,7 +690,15 @@ def process_single_image(image_path, output_dir=None, save_overlay=False,
     img_array = np.array(image)
     height, width = img_array.shape[:2]
 
-    if use_osm:
+    if geojson_gdf is not None:
+        # GeoJSON mode - use pre-downloaded data
+        caravan_mask, caravan_list = fetch_caravans_from_geojson(
+            geojson_gdf,
+            file_info['min_lat'], file_info['min_lon'],
+            file_info['max_lat'], file_info['max_lon'],
+            width, height
+        )
+    elif use_osm:
         # OSM mode - fetch from OpenStreetMap
         if not OSM_AVAILABLE:
             print("  Error: OSM libraries not available")
@@ -641,7 +762,7 @@ def scan_image_folders(root_dir):
 
 
 def process_park(park_name, images, output_dir=None, save_overlays=False,
-                 model=None, use_osm=False):
+                 model=None, use_osm=False, geojson_gdf=None):
     """
     Process all images for a single park, deduplicating caravans.
 
@@ -652,6 +773,7 @@ def process_park(park_name, images, output_dir=None, save_overlays=False,
         save_overlays: Whether to save annotated images
         model: Loaded Mask R-CNN model (if using model detection)
         use_osm: Whether to use OSM data instead of model
+        geojson_gdf: Pre-loaded GeoDataFrame of caravan polygons
     """
     all_caravans = {}  # id -> caravan info (for deduplication)
 
@@ -675,7 +797,8 @@ def process_park(park_name, images, output_dir=None, save_overlays=False,
                 output_dir=park_overlay_dir,
                 save_overlay=save_overlays,
                 model=model,
-                use_osm=use_osm
+                use_osm=use_osm,
+                geojson_gdf=geojson_gdf
             )
 
             # For OSM mode, deduplicate by OSM ID
@@ -719,7 +842,7 @@ def process_park(park_name, images, output_dir=None, save_overlays=False,
 
 
 def process_all_parks(input_dir, output_excel, save_overlays=False,
-                      weights_path=None, use_osm=False):
+                      weights_path=None, use_osm=False, geojson_path=None):
     """
     Process all caravan parks found in the input directory.
 
@@ -729,6 +852,7 @@ def process_all_parks(input_dir, output_excel, save_overlays=False,
         save_overlays: Whether to save annotated images
         weights_path: Path to Mask R-CNN model weights (if using model detection)
         use_osm: Whether to use OSM data instead of model
+        geojson_path: Path to pre-downloaded GeoJSON file with caravan polygons
     """
     print(f"\nScanning {input_dir} for satellite images...")
     parks = scan_image_folders(input_dir)
@@ -742,13 +866,24 @@ def process_all_parks(input_dir, output_excel, save_overlays=False,
     for park_name, images in parks.items():
         print(f"  - {park_name}: {len(images)} images")
 
-    # Load model if using model detection
+    # Load data source
     model = None
-    if not use_osm:
+    geojson_gdf = None
+
+    if geojson_path:
+        # GeoJSON mode - load pre-downloaded data
+        geojson_gdf = load_geojson_caravans(geojson_path)
+    elif use_osm:
+        # OSM mode - will fetch on-the-fly
+        pass
+    else:
+        # Model mode
         if weights_path is None:
-            print("\nERROR: Model weights required for detection.")
-            print("Please provide --weights /path/to/mask_rcnn_caravan.h5")
-            print("Or use --use_osm for OSM data (limited coverage)")
+            print("\nERROR: You must specify a data source.")
+            print("Options:")
+            print("  --geojson PATH   Use pre-downloaded GeoJSON (recommended)")
+            print("  --use_osm        Fetch from OSM on-the-fly")
+            print("  --weights PATH   Use Mask R-CNN model")
             return pd.DataFrame()
 
         model = load_model(weights_path)
@@ -766,7 +901,8 @@ def process_all_parks(input_dir, output_excel, save_overlays=False,
             park_name, images, output_dir,
             save_overlays=save_overlays,
             model=model,
-            use_osm=use_osm
+            use_osm=use_osm,
+            geojson_gdf=geojson_gdf
         )
 
         results.append({
@@ -791,7 +927,12 @@ def process_all_parks(input_dir, output_excel, save_overlays=False,
     print(f"\n{'='*60}")
     print("SUMMARY")
     print(f"{'='*60}")
-    mode_str = "OSM data" if use_osm else "Mask R-CNN model"
+    if geojson_path:
+        mode_str = f"GeoJSON ({geojson_path})"
+    elif use_osm:
+        mode_str = "OSM data (on-the-fly)"
+    else:
+        mode_str = "Mask R-CNN model"
     print(f"Detection mode: {mode_str}")
     print(f"Total parks processed: {len(df)}")
     print(f"Total caravans found: {df['caravan_count'].sum()}")
@@ -808,31 +949,37 @@ def process_all_parks(input_dir, output_excel, save_overlays=False,
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Count caravans in satellite images using Mask R-CNN or OSM data.',
+        description='Count caravans in satellite images using pre-downloaded data, OSM, or Mask R-CNN.',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    # Using Mask R-CNN model (recommended - requires trained weights)
+    # Using pre-downloaded GeoJSON (recommended - fastest, no rate limits)
+    python download_uk_caravans.py --output uk_caravans.geojson  # First, download data
+    python count_caravans_from_images.py --input_dir ./images --output results.xlsx \\
+        --geojson uk_caravans.geojson --save_overlays
+
+    # Using OSM data on-the-fly (may hit rate limits)
+    python count_caravans_from_images.py --input_dir ./images --output results.xlsx --use_osm
+
+    # Using Mask R-CNN model (requires trained weights)
     python count_caravans_from_images.py --input_dir ./images --output results.xlsx \\
         --weights ./logs/caravan20xx/mask_rcnn_caravan_xxxx.h5 --save_overlays
 
-    # Using OSM data (fallback - limited coverage for individual caravans)
-    python count_caravans_from_images.py --input_dir ./images --output results.xlsx --use_osm
+Data Sources:
+    --geojson PATH    Use pre-downloaded GeoJSON file (recommended)
+                      First run: python download_uk_caravans.py --output uk_caravans.geojson
+                      This downloads all UK caravan polygons from OSM once.
 
-Detection Modes:
-    --weights PATH    Use Mask R-CNN model for detection (recommended)
-                      The model should be trained on caravan imagery.
-                      See caravan.py for training instructions.
+    --use_osm         Fetch from OpenStreetMap on-the-fly via osmnx.
+                      May hit rate limits with many images.
 
-    --use_osm         Use OpenStreetMap data instead of model detection.
-                      WARNING: OSM has limited coverage for individual caravans.
-                      Most sites only have the site boundary mapped, not
-                      individual caravan units.
+    --weights PATH    Use Mask R-CNN model for detection.
+                      Requires trained model weights.
 
 Requirements:
+    pip install pandas openpyxl Pillow numpy geopandas shapely rasterio affine requests
+    For OSM mode: pip install osmnx
     For model mode: pip install tensorflow keras scikit-image
-    For OSM mode:   pip install osmnx geopandas shapely rasterio affine
-    Both modes:     pip install pandas openpyxl Pillow numpy
         """
     )
 
@@ -840,14 +987,16 @@ Requirements:
                         help='Root directory containing park folders with satellite images')
     parser.add_argument('--output', required=True,
                         help='Path to output Excel file')
+    parser.add_argument('--geojson', default=None,
+                        help='Path to pre-downloaded GeoJSON file (from download_uk_caravans.py)')
     parser.add_argument('--weights', default=None,
                         help='Path to Mask R-CNN model weights (.h5 file)')
     parser.add_argument('--use_osm', action='store_true',
-                        help='Use OSM data instead of model (limited coverage)')
+                        help='Fetch from OSM on-the-fly (may hit rate limits)')
     parser.add_argument('--save_overlays', action='store_true',
                         help='Save images with detection overlays')
     parser.add_argument('--confidence', type=float, default=0.7,
-                        help='Detection confidence threshold (default: 0.7)')
+                        help='Detection confidence threshold for model mode (default: 0.7)')
 
     args = parser.parse_args()
 
@@ -855,17 +1004,23 @@ Requirements:
         print(f"Error: Input directory not found: {args.input_dir}")
         sys.exit(1)
 
-    # Validate mode
-    if not args.use_osm and args.weights is None:
-        print("ERROR: You must specify either --weights or --use_osm")
+    # Validate mode - need at least one data source
+    if not args.geojson and not args.use_osm and args.weights is None:
+        print("ERROR: You must specify a data source")
         print("\nOptions:")
-        print("  1. Use Mask R-CNN model (recommended):")
-        print("     --weights /path/to/mask_rcnn_caravan.h5")
+        print("  1. Use pre-downloaded GeoJSON (recommended):")
+        print("     python download_uk_caravans.py --output uk_caravans.geojson")
+        print("     python count_caravans_from_images.py ... --geojson uk_caravans.geojson")
         print("")
-        print("  2. Use OSM data (limited coverage):")
+        print("  2. Use OSM on-the-fly:")
         print("     --use_osm")
         print("")
-        print("To train a model, see: python caravan.py train --help")
+        print("  3. Use Mask R-CNN model:")
+        print("     --weights /path/to/mask_rcnn_caravan.h5")
+        sys.exit(1)
+
+    if args.geojson and not os.path.exists(args.geojson):
+        print(f"Error: GeoJSON file not found: {args.geojson}")
         sys.exit(1)
 
     if args.weights and not os.path.exists(args.weights):
@@ -882,7 +1037,8 @@ Requirements:
             output_excel=args.output,
             save_overlays=args.save_overlays,
             weights_path=args.weights,
-            use_osm=args.use_osm
+            use_osm=args.use_osm,
+            geojson_path=args.geojson
         )
     except Exception as e:
         print(f"Error: {e}")
